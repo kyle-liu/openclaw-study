@@ -1,3 +1,16 @@
+/**
+ * 什么 .ts 文件要 import .js 扩展名？
+根本原因：TypeScript 不重写 import 路径
+TypeScript 编译器在将 .ts 编译为 .js 时，不会修改 import 路径中的扩展名。因此：
+
+你写 import from "./foo.ts" → 编译后还是 "./foo.ts" → Node.js 运行时找不到（它只认 .js）
+你写 import from "./foo.js" → 编译后还是 "./foo.js" → Node.js 运行时找到了 dist/foo.js ✓
+TypeScript 的解析规则（moduleResolution: bundler 或 node16/nodenext）
+当你写 import from "./foo.js" 时，TypeScript 会：
+
+先尝试找 foo.ts（源文件）
+再尝试找 foo.js（编译产物）
+ */
 import fs from "node:fs/promises";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import { runGeminiEmbeddingBatches, type GeminiBatchRequest } from "./batch-gemini.js";
