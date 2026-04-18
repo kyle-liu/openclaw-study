@@ -1,3 +1,24 @@
+// ============================================================================
+// auto-reply/reply/dispatch-from-config.ts
+//
+// 这个文件位于“渠道消息分发层”和“reply 核心层”之间。
+//
+// 如果把自动回复主链路拆开：
+// - `provider-dispatcher.ts` / `dispatch.ts`：更外层的消息分发入口
+// - `dispatch-from-config.ts`：把消息通道语义桥接到 reply 核心
+// - `get-reply.ts`：真正的 reply 入口预处理
+// - `get-reply-run.ts`：运行组装
+// - `agent-runner.ts`：生命周期总编排
+//
+// 因此，这个文件最重要的职责不是“生成回复内容”，而是：
+// 1. 在调用 `getReplyFromConfig()` 之前，先处理消息系统层面的事情
+// 2. 把 reply 过程中的 tool/block/final payload 接回到具体消息通道
+// 3. 统一处理 diagnostics、hooks、send policy、route-to-origin、TTS 等外围语义
+//
+// 可以把它理解成：
+// “消息分发层 -> reply 核心层”的桥接器 / 适配器。
+// ============================================================================
+
 import { resolveSessionAgentId } from "../../agents/agent-scope.js";
 import type { OpenClawConfig } from "../../config/config.js";
 import {
@@ -36,10 +57,14 @@ import { shouldSuppressReasoningPayload } from "./reply-payloads.js";
 import { isRoutableChannel, routeReply } from "./route-reply.js";
 import { resolveRunTypingPolicy } from "./typing-policy.js";
 
+// 某些通道会把音频消息包装成占位文本或标准头部。
+// 这里先准备几个轻量启发式规则，用来判断这条消息是否属于“音频输入语境”。
 const AUDIO_PLACEHOLDER_RE = /^<media:audio>(\s*\([^)]*\))?$/i;
 const AUDIO_HEADER_RE = /^\[Audio\b/i;
 const normalizeMediaType = (value: string): string => value.split(";")[0]?.trim().toLowerCase();
 
+// 判断当前入站消息是否应按“音频输入”处理。
+// 这会影响后面的 TTS 策略与某些通道输出行为。
 const isInboundAudioContext = (ctx: FinalizedMsgContext): boolean => {
   const rawTypes = [
     typeof ctx.MediaType === "string" ? ctx.MediaType : undefined,
@@ -70,6 +95,8 @@ const isInboundAudioContext = (ctx: FinalizedMsgContext): boolean => {
   return AUDIO_HEADER_RE.test(trimmed);
 };
 
+// 根据当前消息定位 session store 中已有的 session entry。
+// dispatch 层在决定 send policy / TTS auto / ACP 分流时，经常需要先读一眼 session 状态。
 const resolveSessionStoreLookup = (
   ctx: FinalizedMsgContext,
   cfg: OpenClawConfig,
@@ -103,6 +130,12 @@ export type DispatchFromConfigResult = {
   counts: Record<ReplyDispatchKind, number>;
 };
 
+// 这是“普通消息路径”里最靠近 reply 核心的 dispatch 入口。
+// 上游把一条已经 finalize 过的入站消息交进来后，这里会：
+// - 做重复消息过滤、hooks、send policy、route 策略
+// - 决定是否先走 fast abort / ACP
+// - 最终调用 `getReplyFromConfig()` 获取回复
+// - 再把 tool/block/final payload 回送到 dispatcher 或 originating channel
 export async function dispatchReplyFromConfig(params: {
   ctx: FinalizedMsgContext;
   cfg: OpenClawConfig;
@@ -119,6 +152,7 @@ export async function dispatchReplyFromConfig(params: {
   const startTime = diagnosticsEnabled ? Date.now() : 0;
   const canTrackSession = diagnosticsEnabled && Boolean(sessionKey);
 
+  // diagnostics 辅助：统一记录“这条消息最终是完成、跳过还是报错”。
   const recordProcessed = (
     outcome: "completed" | "skipped" | "error",
     opts?: {
@@ -141,6 +175,7 @@ export async function dispatchReplyFromConfig(params: {
     });
   };
 
+  // diagnostics 辅助：进入 dispatch 主逻辑时，把 session 标记为 processing。
   const markProcessing = () => {
     if (!canTrackSession || !sessionKey) {
       return;
@@ -153,6 +188,7 @@ export async function dispatchReplyFromConfig(params: {
     });
   };
 
+  // diagnostics 辅助：离开 dispatch 主逻辑时，把 session 标记回 idle。
   const markIdle = (reason: string) => {
     if (!canTrackSession || !sessionKey) {
       return;
@@ -164,11 +200,13 @@ export async function dispatchReplyFromConfig(params: {
     });
   };
 
+  // 重复入站直接短路，避免同一消息被重复驱动回复链。
   if (shouldSkipDuplicateInbound(ctx)) {
     recordProcessed("skipped", { reason: "duplicate" });
     return { queuedFinal: false, counts: dispatcher.getQueuedCounts() };
   }
 
+  // 先解析当前 session 的已有状态，供后面的 ACP / TTS / send policy 使用。
   const sessionStoreEntry = resolveSessionStoreLookup(ctx, cfg);
   const acpDispatchSessionKey = sessionStoreEntry.sessionKey ?? sessionKey;
   const inboundAudio = isInboundAudioContext(ctx);
@@ -207,13 +245,13 @@ export async function dispatchReplyFromConfig(params: {
     );
   }
 
-  // Check if we should route replies to originating channel instead of dispatcher.
-  // Only route when the originating channel is DIFFERENT from the current surface.
-  // This handles cross-provider routing (e.g., message from Telegram being processed
-  // by a shared session that's currently on Slack) while preserving normal dispatcher
-  // flow when the provider handles its own messages.
+  // 这里开始决定“回复应该发回哪里”。
   //
-  // Debug: `pnpm test src/auto-reply/reply/dispatch-from-config.test.ts`
+  // 默认情况下，reply payload 会交给当前 dispatcher。
+  // 但如果消息最初来自另一个 channel，并且当前 surface 只是代管/转发，
+  // 那么应该把回复 route 回 originating channel，而不是留在当前 surface。
+  //
+  // 这是跨 provider / 共享 session 场景的关键桥接逻辑。
   const originatingChannel = normalizeMessageChannel(ctx.OriginatingChannel);
   const originatingTo = ctx.OriginatingTo;
   const providerChannel = normalizeMessageChannel(ctx.Provider);
@@ -234,12 +272,8 @@ export async function dispatchReplyFromConfig(params: {
     shouldRouteToOriginating || originatingChannel === INTERNAL_MESSAGE_CHANNEL;
   const ttsChannel = shouldRouteToOriginating ? originatingChannel : currentSurface;
 
-  /**
-   * Helper to send a payload via route-reply (async).
-   * Only used when actually routing to a different provider.
-   * Note: Only called when shouldRouteToOriginating is true, so
-   * originatingChannel and originatingTo are guaranteed to be defined.
-   */
+  // 小辅助：当决定 route 回 originating channel 时，用它统一发送 payload。
+  // 这使后面的 tool/block/final 分支都不必重复 routeReply 样板代码。
   const sendPayloadAsync = async (
     payload: ReplyPayload,
     abortSignal?: AbortSignal,
@@ -274,6 +308,8 @@ export async function dispatchReplyFromConfig(params: {
   markProcessing();
 
   try {
+    // 某些“停止/中断”类消息不需要走完整 reply 核心链。
+    // 如果 fast abort 已经处理完，就在 dispatch 层直接产出最终回复。
     const fastAbort = await tryFastAbortFromMessage({ ctx, cfg });
     if (fastAbort.handled) {
       const payload = {
@@ -312,8 +348,11 @@ export async function dispatchReplyFromConfig(params: {
       return { queuedFinal, counts };
     }
 
+    // ACP（某类更快/更专用的控制路径）对控制命令可能有特殊分流规则。
     const bypassAcpForCommand = shouldBypassAcpDispatchForCommand(ctx, cfg);
 
+    // 在真正生成回复之前，先检查当前 session 是否允许发送。
+    // 如果 send policy 明确禁止，则直接在这里结束，不进入 reply 核心。
     const sendPolicy = resolveSendPolicy({
       cfg,
       entry: sessionStoreEntry.entry,
@@ -336,7 +375,11 @@ export async function dispatchReplyFromConfig(params: {
       return { queuedFinal: false, counts };
     }
 
+    // group/native 场景往往不适合发送冗长的 tool summary 文本；
+    // 但纯媒体类结果（比如 TTS 音频）仍然应该被传递出去。
     const shouldSendToolSummaries = ctx.ChatType !== "group" && ctx.CommandSource !== "native";
+    // 先给 ACP 一个机会直接接管这条消息。
+    // 如果 ACP 已经消费了消息，就不再进入普通 reply 核心。
     const acpDispatch = await tryDispatchAcpReply({
       ctx,
       cfg,
@@ -364,6 +407,9 @@ export async function dispatchReplyFromConfig(params: {
     let accumulatedBlockText = "";
     let blockCount = 0;
 
+    // tool result 出口过滤器：
+    // - 某些场景保留完整 tool summary
+    // - 某些场景只保留媒体，不保留文字
     const resolveToolDeliveryPayload = (payload: ReplyPayload): ReplyPayload | null => {
       if (shouldSendToolSummaries) {
         return payload;
@@ -376,6 +422,7 @@ export async function dispatchReplyFromConfig(params: {
       }
       return { ...payload, text: undefined };
     };
+    // dispatch 层统一决定这次 run 的 typing 策略，再把结果塞给 reply 核心。
     const typing = resolveRunTypingPolicy({
       requestedPolicy: params.replyOptions?.typingPolicy,
       suppressTyping: params.replyOptions?.suppressTyping === true || shouldSuppressTyping,
@@ -383,6 +430,14 @@ export async function dispatchReplyFromConfig(params: {
       systemEvent: shouldRouteToOriginating,
     });
 
+    // 这里是普通消息路径对 `reply.js` / `getReplyFromConfig()` 的真正调用点。
+    //
+    // 注意这层不是直接等一个“最终文本”回来，而是把两类回调也一并交进去：
+    // - `onToolResult`：reply 核心在运行过程中产生 tool result 时，如何外发
+    // - `onBlockReply`：reply 核心在 block streaming 过程中产生块回复时，如何外发
+    //
+    // 这就是 dispatch-from-config.ts 最核心的桥接职责：
+    // reply 核心负责“生成什么”，dispatch 层负责“这些内容如何送出去”。
     const replyResult = await (params.replyResolver ?? getReplyFromConfig)(
       ctx,
       {
@@ -391,6 +446,7 @@ export async function dispatchReplyFromConfig(params: {
         suppressTyping: typing.suppressTyping,
         onToolResult: (payload: ReplyPayload) => {
           const run = async () => {
+            // tool result 也可能需要走 TTS 包装。
             const ttsPayload = await maybeApplyTtsToPayload({
               payload,
               cfg,
@@ -403,6 +459,9 @@ export async function dispatchReplyFromConfig(params: {
             if (!deliveryPayload) {
               return;
             }
+            // 根据前面 route 策略，决定是：
+            // - route 回 originating channel
+            // - 还是交给当前 dispatcher
             if (shouldRouteToOriginating) {
               await sendPayloadAsync(deliveryPayload, undefined, false);
             } else {
@@ -419,7 +478,7 @@ export async function dispatchReplyFromConfig(params: {
             if (shouldSuppressReasoningPayload(payload)) {
               return;
             }
-            // Accumulate block text for TTS generation after streaming
+            // block streaming 期间顺手累计文本，供“只生成 TTS final 音频”的兜底路径使用。
             if (payload.text) {
               if (accumulatedBlockText.length > 0) {
                 accumulatedBlockText += "\n";
@@ -447,6 +506,8 @@ export async function dispatchReplyFromConfig(params: {
       cfg,
     );
 
+    // 某些 reset 流程会在 ACP 原地处理后，额外留下一段“尾 prompt”。
+    // 这里检测到该标志后，再补跑一次 ACP dispatch，把尾部逻辑接上。
     if (ctx.AcpDispatchTailAfterReset === true) {
       // Command handling prepared a trailing prompt after ACP in-place reset.
       // Route that tail through ACP now (same turn) instead of embedded dispatch.
@@ -473,6 +534,7 @@ export async function dispatchReplyFromConfig(params: {
       }
     }
 
+    // 统一把 reply 核心返回值正规化为数组，便于后面统一发送 final payload。
     const replies = replyResult ? (Array.isArray(replyResult) ? replyResult : [replyResult]) : [];
 
     let queuedFinal = false;
@@ -514,10 +576,13 @@ export async function dispatchReplyFromConfig(params: {
           routedFinalCount += 1;
         }
       } else {
+        // 常规路径：final reply 直接交给 dispatcher 排队/发送。
         queuedFinal = dispatcher.sendFinalReply(ttsReply) || queuedFinal;
       }
     }
 
+    // block streaming 成功时，reply 核心可能没有留下 final text payload。
+    // 但如果累计过 block 文本，并且 TTS 模式需要 final 音频，这里会合成一个 TTS-only final reply 兜底发送。
     const ttsMode = resolveTtsConfig(cfg).mode ?? "final";
     // Generate TTS-only reply after block streaming completes (when there's no final reply).
     // This handles the case where block streaming succeeds and drops final payloads,
@@ -577,12 +642,16 @@ export async function dispatchReplyFromConfig(params: {
       }
     }
 
+    // 函数最终返回的不是“回复文本”，而是 dispatch 结果摘要：
+    // - 有没有成功排队 final reply
+    // - 各类 payload 被 dispatcher 接收了多少
     const counts = dispatcher.getQueuedCounts();
     counts.final += routedFinalCount;
     recordProcessed("completed");
     markIdle("message_completed");
     return { queuedFinal, counts };
   } catch (err) {
+    // dispatch 层负责把异常同样纳入 diagnostics / session state 收口。
     recordProcessed("error", { error: String(err) });
     markIdle("message_error");
     throw err;
