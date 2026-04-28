@@ -12,6 +12,16 @@ import {
 import type { FinalizedMsgContext, MsgContext } from "./templating.js";
 import type { GetReplyOptions } from "./types.js";
 
+// 这个文件可以看成 auto-reply 的“dispatch 入口层”：
+// - 不直接生成模型回复
+// - 不直接决定工具结果/块回复如何外发
+// - 主要负责把“入站消息 + dispatcher”接入 reply pipeline
+//
+// 职责分层可以概括成：
+// 1. `withReplyDispatcher()`：保证 dispatcher 生命周期一定被收口
+// 2. `dispatchInboundMessage()`：标准化上下文并调用 `dispatchReplyFromConfig()`
+// 3. `dispatchInboundMessageWithBufferedDispatcher()`：帮上游创建“带 typing 配套能力”的 dispatcher
+// 4. `dispatchInboundMessageWithDispatcher()`：帮上游创建“普通 dispatcher”
 export type DispatchInboundResult = DispatchFromConfigResult;
 
 // 这是一个泛型辅助函数：
@@ -172,10 +182,17 @@ export async function dispatchInboundMessageWithBufferedDispatcher(params: {
   replyOptions?: Omit<GetReplyOptions, "onToolResult" | "onBlockReply">;
   replyResolver?: typeof import("./reply.js").getReplyFromConfig;
 }): Promise<DispatchInboundResult> {
+  // 这个版本适合“需要 typing controller 配套逻辑”的渠道。
+  //
+  // 与普通 dispatcher 不同，这里不是只创建一个发送器对象，
+  // 而是额外拿到：
+  // - `replyOptions`：需要自动注入到底层 reply pipeline 的 typing 回调
+  // - `markDispatchIdle()`：dispatch 结束后显式关闭 typing/idle 状态
   const { dispatcher, replyOptions, markDispatchIdle } = createReplyDispatcherWithTyping(
     params.dispatcherOptions,
   );
   try {
+    // 上游传入的 replyOptions 与 dispatcher 自带的 typing 回调配置在这里合并。
     return await dispatchInboundMessage({
       ctx: params.ctx,
       cfg: params.cfg,
@@ -191,6 +208,17 @@ export async function dispatchInboundMessageWithBufferedDispatcher(params: {
   }
 }
 
+// 这是“普通 dispatcher”版本的便捷入口。
+//
+// 如果上游还没有真正的 `ReplyDispatcher` 实例，只持有一份
+// `ReplyDispatcherOptions` 配置，就可以走这个函数。
+//
+// 它的工作非常单纯：
+// 1. 用 `createReplyDispatcher(...)` 把配置创建成 dispatcher 实例
+// 2. 再把这个实例交给更核心的 `dispatchInboundMessage(...)`
+//
+// Java 对照理解：
+// 这很像一个“先 new 依赖，再委托给核心方法”的包装函数。
 export async function dispatchInboundMessageWithDispatcher(params: {
   ctx: MsgContext | FinalizedMsgContext;
   cfg: OpenClawConfig;
@@ -198,7 +226,11 @@ export async function dispatchInboundMessageWithDispatcher(params: {
   replyOptions?: Omit<GetReplyOptions, "onToolResult" | "onBlockReply">;
   replyResolver?: typeof import("./reply.js").getReplyFromConfig;
 }): Promise<DispatchInboundResult> {
+  // 根据调用方提供的发送配置，创建一个普通 dispatcher。
   const dispatcher = createReplyDispatcher(params.dispatcherOptions);
+
+  // 然后把真正的工作委托给 dispatch 主入口。
+  // 也就是说，这个函数本身不做复杂业务逻辑，只做“依赖创建 + 转调”。
   return await dispatchInboundMessage({
     ctx: params.ctx,
     cfg: params.cfg,
